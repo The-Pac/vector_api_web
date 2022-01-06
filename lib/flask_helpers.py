@@ -24,6 +24,7 @@ from threading import Thread
 import webbrowser
 from time import sleep
 from io import BytesIO
+
 try:
     from flask import make_response, Response, send_file
 except ImportError:

@@ -3,25 +3,40 @@ import json
 import sys
 import time
 from enum import Enum
+
+import cv2
+
 from lib import flask_helpers
 
+from starlette.responses import StreamingResponse
 import anki_vector
 from anki_vector import util
 from anki_vector import annotate
 
 try:
-    from flask import Flask, request, render_template
+    from flask import Flask, request, render_template, jsonify
 except ImportError:
-    sys.exit("Cannot import from flask: Do `pip3 install --user flask` to install")
+    sys.exit()
 
 try:
     from PIL import Image, ImageDraw
 except ImportError:
-    sys.exit("Cannot import from PIL: Do `pip3 install --user Pillow` to install")
+    sys.exit()
+
+
+def run():
+    args = util.parse_command_args()
+
+    with anki_vector.AsyncRobot(args.serial, enable_face_detection=True, show_3d_viewer=True) as robot:
+        flask_app.remote_control_vector = RemoteControlVector(robot)
+
+    robot.camera.init_camera_feed()
+    robot.behavior.drive_off_charger()
+
+    flask_helpers.run_flask(flask_app)
 
 
 def create_default_image(image_width, image_height, do_gradient=False):
-    """Create a place-holder PIL image to use until we have a live feed from Vector"""
     image_bytes = bytearray([0x70, 0x70, 0x70]) * image_width * image_height
 
     if do_gradient:
@@ -39,11 +54,9 @@ def create_default_image(image_width, image_height, do_gradient=False):
 
 flask_app = Flask(__name__)
 _default_camera_image = create_default_image(320, 240)
-_is_mouse_look_enabled_by_default = False
 
 
 def remap_to_range(x, x_min, x_max, out_min, out_max):
-    """convert x (in x_min..x_max range) to out_min..out_max range"""
     if x < x_min:
         return out_min
     if x > x_max:
@@ -80,10 +93,8 @@ class RemoteControlVector:
         self.go_slow = 0
 
         self.action_queue = []
-        self.text_to_say = "Hi I'm Vector"
 
     def update_drive_state(self, key_code, is_key_down, speed_changed):
-        """Update state of driving intent from keyboard, and if anything changed then call update_driving"""
         update_driving = True
         if key_code == ord('Z'):
             self.drive_forwards = is_key_down
@@ -171,20 +182,18 @@ class RemoteControlVector:
         self.vector.motors.set_lift_motor(lift_vel)
 
     def update_head(self):
-        if not self.is_mouse_look_enabled:
-            head_speed = self.pick_speed(2, 1, 0.5)
-            head_vel = (self.head_up - self.head_down) * head_speed
-            if self.last_head and head_vel == self.last_head:
-                return
-            self.last_head = head_vel
-            self.vector.motors.set_head_motor(head_vel)
+        head_speed = self.pick_speed(2, 1, 0.5)
+        head_vel = (self.head_up - self.head_down) * head_speed
+        if self.last_head and head_vel == self.last_head:
+            return
+        self.last_head = head_vel
+        self.vector.motors.set_head_motor(head_vel)
 
     def update_mouse_driving(self):
         drive_dir = (self.drive_forwards - self.drive_back)
 
         turn_dir = (self.turn_right - self.turn_left) + self.mouse_dir
         if drive_dir < 0:
-            # It feels more natural to turn the opposite way when reversing
             turn_dir = -turn_dir
 
         forward_speed = self.pick_speed(150, 75, 50)
@@ -198,10 +207,6 @@ class RemoteControlVector:
             return
         self.last_wheels = wheel_params
         self.vector.motors.set_wheel_motors(*wheel_params)
-
-
-def to_js_bool_string(bool_value):
-    return "true" if bool_value else "false"
 
 
 @flask_app.route("/")
@@ -228,25 +233,24 @@ def streaming_video():
             time.sleep(.1)
 
 
-def serve_single_image():
-    if flask_app.remote_control_vector:
-        image = get_annotated_image()
-        if image:
-            return flask_helpers.serve_pil_image(image)
+@flask_app.route("/batterie")
+def get_batterie():
+    with anki_vector.Robot() as robot:
+        battery_state = robot.get_battery_state()
+        if battery_state:
+            batterie = json.dumps({"volt": battery_state.battery_volts,
+                                   "level": battery_state.battery_level,
+                                   "on_charge": battery_state.is_charging,
+                                   "on_charger": battery_state.is_on_charger_platform,
+                                   "estimated_time": battery_state.suggested_charger_sec})
+            return jsonify(batterie)
 
-    return flask_helpers.serve_pil_image(_default_camera_image)
 
-
-def is_microsoft_browser(req):
-    agent = req.user_agent.string
-    return 'Edge/' in agent or 'MSIE ' in agent or 'Trident/' in agent
-
-
-@flask_app.route("/vectorImage")
+@flask_app.route("/view")
 def handle_vectorImage():
-    if is_microsoft_browser(request):
-        return serve_single_image()
-    return flask_helpers.stream_video(streaming_video)
+    cv2img = streaming_video()
+    res, im_png = cv2.imencode(".png", cv2img)
+    return StreamingResponse(io.BytesIO(im_png.tobytes()), media_type="image/png")
 
 
 def handle_key_event(key_request, is_key_down):
@@ -273,18 +277,6 @@ def handle_updateVector():
         flask_app.remote_control_vector.update()
 
     return ""
-
-
-def run():
-    args = util.parse_command_args()
-
-    with anki_vector.AsyncRobot(args.serial, enable_face_detection=True) as robot:
-        flask_app.remote_control_vector = RemoteControlVector(robot)
-
-        robot.camera.init_camera_feed()
-        robot.behavior.drive_off_charger()
-
-        flask_helpers.run_flask(flask_app)
 
 
 if __name__ == '__main__':
